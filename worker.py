@@ -9,6 +9,7 @@ Rules:
 - If Claude API fails, do NOT mark email as read
 - Shopify contact form emails (mailer@shopify.com) are real customers
 - Never auto-send return address — every return needs an RMA first
+- Replies are sent as HTML for proper formatting
 """
 
 import os
@@ -28,10 +29,8 @@ MAILBOX_USER  = os.environ["MAILBOX_USER"]
 
 GRAPH_BASE = "https://graph.microsoft.com/v1.0"
 
-# Only process emails from this date onwards
 CUTOFF_DATE = datetime(2026, 5, 11, 0, 0, 0, tzinfo=timezone.utc)
 
-# Senders / domains to always skip (suppliers, spam, internal)
 SKIP_SENDERS = {
     "funnymee.com",
     "163.com",
@@ -143,8 +142,6 @@ ORDER STATUS / WHERE IS MY ORDER:
 SAME-DAY / EXPRESS DELIVERY QUESTIONS:
   Explain clearly: "Same-day shipping means your order is dispatched
   the same day. Final delivery timing depends on the carrier's schedule."
-  If express shipping was paid and delivery was missed, acknowledge it
-  and flag for review — but do NOT promise a refund automatically.
 
 RETURNS:
   NEVER include the return address in an auto-reply.
@@ -161,7 +158,7 @@ NO PHYSICAL STORE:
 
 ━━━ EMAIL SIGNATURE ━━━
 
-Always include this at the very end of every reply:
+Always include this at the very end of every reply, exactly as shown:
 
 ___________________
 
@@ -179,9 +176,64 @@ Respond ONLY with valid JSON — no markdown, no extra text:
   "is_customer_email": true,
   "should_auto_send": true,
   "sensitivity_reason": "",
-  "reply": "Full reply text here, with short paragraphs and blank lines between them, ending with the signature"
+  "reply": "Full reply text here, with blank lines between short paragraphs, ending with the signature block exactly as shown above"
 }
 """
+
+# ── HTML Formatting ───────────────────────────────────────────────────────────
+
+def format_reply_html(reply_text: str) -> str:
+    """
+    Convert plain-text reply into clean HTML.
+
+    - Content before the signature is split on blank lines into <p> tags.
+    - The signature block (starting with ___________________) uses <br> tags.
+    - A horizontal rule separates body from signature.
+    """
+    SIGNATURE_MARKER = "___________________"
+
+    # Split body from signature
+    if SIGNATURE_MARKER in reply_text:
+        body_part, sig_part = reply_text.split(SIGNATURE_MARKER, 1)
+    else:
+        body_part = reply_text
+        sig_part  = ""
+
+    # Convert body paragraphs (split on blank lines)
+    body_html = ""
+    paragraphs = re.split(r"\n{2,}", body_part.strip())
+    for para in paragraphs:
+        para = para.strip()
+        if para:
+            # Replace single newlines within a paragraph with <br>
+            para = para.replace("\n", "<br>")
+            body_html += f"<p>{para}</p>\n"
+
+    # Convert signature lines to <br>-separated block
+    sig_html = ""
+    if sig_part:
+        sig_lines = sig_part.strip().split("\n")
+        sig_html_lines = []
+        for line in sig_lines:
+            escaped = line.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+            sig_html_lines.append(escaped)
+        sig_inner = "<br>".join(sig_html_lines)
+        sig_html = (
+            f'<hr style="border:none;border-top:1px solid #ccc;margin:16px 0;">\n'
+            f'<p style="color:#555;font-size:13px;line-height:1.6;">'
+            f'{sig_inner}'
+            f'</p>\n'
+        )
+
+    html = (
+        '<!DOCTYPE html><html><body '
+        'style="font-family:Arial,sans-serif;font-size:14px;color:#333;line-height:1.6;">\n'
+        f'{body_html}'
+        f'{sig_html}'
+        '</body></html>'
+    )
+    return html
+
 
 # ── Microsoft Graph helpers ───────────────────────────────────────────────────
 
@@ -254,18 +306,56 @@ def mark_read(token: str, message_id: str):
           json={"isRead": True})
 
 
-def send_reply(token: str, message_id: str, reply_text: str):
-    r = graph("POST", f"/users/{MAILBOX_USER}/messages/{message_id}/reply", token,
-              headers={"Content-Type": "application/json"},
-              json={"comment": reply_text})
-    r.raise_for_status()
-
-
-def create_draft_reply(token: str, message_id: str, reply_text: str):
+def create_reply_draft(token: str, message_id: str) -> str:
+    """Create a blank reply draft and return its draft message ID."""
     r = graph("POST", f"/users/{MAILBOX_USER}/messages/{message_id}/createReply", token,
               headers={"Content-Type": "application/json"},
-              json={"comment": reply_text})
+              json={})
     r.raise_for_status()
+    return r.json()["id"]
+
+
+def update_draft_body(token: str, draft_id: str, html_body: str):
+    """Update the draft's body with HTML content."""
+    r = graph("PATCH", f"/users/{MAILBOX_USER}/messages/{draft_id}", token,
+              headers={"Content-Type": "application/json"},
+              json={
+                  "body": {
+                      "contentType": "html",
+                      "content": html_body,
+                  }
+              })
+    r.raise_for_status()
+
+
+def send_draft(token: str, draft_id: str):
+    """Send an existing draft message."""
+    r = graph("POST", f"/users/{MAILBOX_USER}/messages/{draft_id}/send", token,
+              headers={"Content-Type": "application/json"})
+    r.raise_for_status()
+
+
+def send_reply_html(token: str, message_id: str, reply_text: str):
+    """
+    Full 3-step HTML send:
+    1. Create reply draft
+    2. Update draft body as HTML
+    3. Send the draft
+    """
+    html_body  = format_reply_html(reply_text)
+    draft_id   = create_reply_draft(token, message_id)
+    update_draft_body(token, draft_id, html_body)
+    send_draft(token, draft_id)
+
+
+def save_reply_draft(token: str, message_id: str, reply_text: str):
+    """
+    Create a draft for owner review (sensitive cases).
+    Uses same 2-step flow but does NOT send.
+    """
+    html_body = format_reply_html(reply_text)
+    draft_id  = create_reply_draft(token, message_id)
+    update_draft_body(token, draft_id, html_body)
 
 
 # ── Utilities ─────────────────────────────────────────────────────────────────
@@ -384,16 +474,16 @@ def main():
 
         if result.get("should_auto_send"):
             try:
-                send_reply(token, msg_id, reply_text)
+                send_reply_html(token, msg_id, reply_text)
                 mark_read(token, msg_id)
-                print("  AUTO-REPLY SENT")
+                print("  AUTO-REPLY SENT (HTML)")
             except Exception as exc:
                 print(f"  ERROR — failed to send reply: {exc}")
         else:
             try:
-                create_draft_reply(token, msg_id, reply_text)
+                save_reply_draft(token, msg_id, reply_text)
                 reason = result.get("sensitivity_reason", "requires review")
-                print(f"  DRAFT SAVED — reason: {reason}")
+                print(f"  DRAFT SAVED (HTML) — reason: {reason}")
             except Exception as exc:
                 print(f"  ERROR — failed to create draft: {exc}")
 
