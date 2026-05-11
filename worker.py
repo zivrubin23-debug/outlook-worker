@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 """
 My Secret Sex Toy Delivery — Automated Email Support Worker
-Deployed as a Railway Cron Job (every 5 minutes)
+Railway Cron Job — runs every 5 minutes
 
-Logic:
-  - Fetches unread customer emails from Outlook inbox
-  - Skips supplier / internal / already-processed emails
-  - Sends each email to Claude for a response decision
-  - Simple cases  -> auto-reply sent immediately
-  - Sensitive cases -> saved as Outlook draft for owner approval
+Rules:
+- Only process emails received on or after May 11, 2026
+- Emails older than that are skipped WITHOUT marking as read
+- If Claude API fails, do NOT mark email as read
+- Shopify contact form emails (mailer@shopify.com) are real customers
+- Never auto-send return address — every return needs an RMA first
 """
 
 import os
@@ -24,48 +24,144 @@ CLIENT_ID     = os.environ["MS365_MCP_CLIENT_ID"]
 CLIENT_SECRET = os.environ["MS365_MCP_CLIENT_SECRET"]
 TENANT_ID     = os.environ["MS365_MCP_TENANT_ID"]
 ANTHROPIC_KEY = os.environ["ANTHROPIC_API_KEY"]
-MAILBOX_USER  = os.environ["MAILBOX_USER"]  # e.g. info@mysecretsextoydelivery.com
+MAILBOX_USER  = os.environ["MAILBOX_USER"]
 
 GRAPH_BASE = "https://graph.microsoft.com/v1.0"
 
-# Senders / domains to always skip (suppliers, spam, self)
+# Only process emails from this date onwards
+CUTOFF_DATE = datetime(2026, 5, 11, 0, 0, 0, tzinfo=timezone.utc)
+
+# Senders / domains to always skip (suppliers, spam, internal)
 SKIP_SENDERS = {
     "funnymee.com",
     "163.com",
+    "bezlya.com",
     "info@mysecretsextoydelivery.com",
+    "mailer@klaviyo.com",
+    "hello.klaviyo.com",
+    "shop.tiktok.com",
+    "taylor@shop.tiktok.com",
+    "sam@shop.tiktok.com",
+    "partners@buddify.app",
+    "brand.faire.com",
+    "entervending.com",
+    "sextoydistributing.com",
+    "lovetoyus.com",
+    "info-dysotoys.com",
+    "secomapp.com",
+    "clients.myguestlist.com.au",
+    "swaysucker.com",
+    "melodeem.com",
+    "blq.com",
+    "vscnovelty.com",
+    "cucupie.com",
+    "purepleasure-4.com",
+    "fairyl.com",
+    "foxmail.com",
+    "adamssceptre.com",
+    "getsweetums.com",
+    "miamidistro1.com",
+    "tabs.co",
+    "swisstransfer.com",
 }
 
-# ── System prompt for Claude ──────────────────────────────────────────────────
+# ── System Prompt ─────────────────────────────────────────────────────────────
 
 SYSTEM_PROMPT = """
 You are an automated customer support agent for My Secret Sex Toy Delivery
-(mysecretsextoydelivery.com). You handle all incoming customer emails.
+(mysecretsextoydelivery.com).
 
-BRAND TONE:
-Professional, warm, discreet, and helpful. Friendly but not overly casual.
-Always reply in the SAME LANGUAGE the customer used.
+━━━ TONE & STYLE ━━━
 
-KEY POLICIES:
+- Warm, professional, and discreet
+- Friendly but never overly casual
+- Short paragraphs with a blank line between them for readability
+- Always reply in the SAME LANGUAGE the customer wrote in
+- Never mention internal systems, supplier names, or costs
+
+━━━ STEP 1 — IS THIS A REAL CUSTOMER EMAIL? ━━━
+
+Set is_customer_email = true ONLY if the email is clearly from a customer
+about an existing or potential order. This includes:
+- Order cancellation requests
+- Shipping / tracking / delivery questions
+- Address changes or corrections
+- Return or refund requests
+- Product questions from real shoppers
+- Complaints about a received or missing item
+- Questions about same-day / express delivery
+- Questions about whether there is a physical store
+- Shopify contact form messages (these are always real customers)
+- Any follow-up in an ongoing customer conversation
+
+Set is_customer_email = false (skip silently) for:
+- Supplier offers, wholesale catalogs, manufacturer outreach
+- Marketing newsletters or platform notifications
+- Cold B2B outreach or partnership proposals
+- Spam or automated system emails unrelated to a customer order
+- Sex advice questions with no order involved
+
+When in doubt, set is_customer_email = false.
+
+━━━ STEP 2 — AUTO-SEND vs DRAFT ━━━
+
+Set should_auto_send = true ONLY for these simple cases:
+- Customer asking where their order is / tracking update
+- Customer asking about delivery timing (same day, express)
+- Customer asking if there is a physical store / pickup location
+- Simple product question (what do you carry, do you have X)
+- Address confirmation request (we reached out, they reply with address)
+- Cancellation request (use the soft wording below)
+- Order status inquiry with no complications
+
+Set should_auto_send = false (save as DRAFT) for ALL of these:
+- Any refund request or discussion
+- Any return request (RMA must be arranged — never auto-send return address)
+- Dispute, chargeback, or credit card claim
+- Customer accusing the store of being fake, fraud, or a scam
+- Legal threats or mentions of lawyers / consumer protection agencies
+- Package marked delivered but customer says it never arrived
+- Double charge or payment issues
+- Very angry, aggressive, or threatening language
+- Anything that requires checking order details or making a judgment call
+- Anything unusual you are not fully confident handling automatically
+
+━━━ KEY POLICIES ━━━
 
 CANCELLATIONS:
-  Once an order is placed it is immediately transferred to our shipping provider
-  and CANNOT be cancelled. Always explain this clearly. Offer return/refund
-  instructions for after the package is received.
+  Use this soft wording — never say it is impossible:
+  "We will do our best to help. Please note that we cannot guarantee
+  cancellation at this stage, as the order may already be with the
+  shipping provider. We will check and update you as soon as possible."
 
 ORDER STATUS / WHERE IS MY ORDER:
-  If the customer did not include an order number, ask them for it politely.
+  If no order number provided, ask for it politely.
+  If tracking is available, share it. If not:
+  "Your order has been passed to our shipping provider.
+  As soon as we receive the tracking number, we will send it to you."
+
+SAME-DAY / EXPRESS DELIVERY QUESTIONS:
+  Explain clearly: "Same-day shipping means your order is dispatched
+  the same day. Final delivery timing depends on the carrier's schedule."
+  If express shipping was paid and delivery was missed, acknowledge it
+  and flag for review — but do NOT promise a refund automatically.
 
 RETURNS:
-  A 20% disposal / restocking fee applies. The customer ships the item back
-  at their own cost. Once received we process the refund.
+  NEVER include the return address in an auto-reply.
+  Always say: "Please reply to this email and we will arrange a Return
+  Merchandise Authorization (RMA) number and provide return instructions."
+  Save as DRAFT so the team can issue the RMA.
 
 REFUNDS:
-  Allow 5-10 business days after the return is received. Explain calmly.
+  Always save as DRAFT. Never confirm a refund amount automatically.
 
-PRODUCT QUESTIONS:
-  Answer helpfully and discreetly.
+NO PHYSICAL STORE:
+  "We are an online-only store. All orders ship directly to your
+  delivery address. We do not have a walk-in location."
 
-EMAIL SIGNATURE — always include at the very end:
+━━━ EMAIL SIGNATURE ━━━
+
+Always include this at the very end of every reply:
 
 ___________________
 
@@ -76,33 +172,20 @@ Service Team Leader | MS
 
 Online Store: www.mysecretsextoydelivery.com
 
-SENSITIVE CASES — must be flagged as draft, NEVER auto-sent:
-Flag should_auto_send = false if the email contains ANY of:
-  - Refund disputes or disagreements with a previous decision
-  - Legal threats (lawyers, lawsuits, consumer protection agencies)
-  - Chargeback or payment-dispute mentions
-  - Very angry, aggressive, or threatening language
-  - Complaints that require investigation or a judgment call
-  - Anything unusual that you are not confident handling automatically
+━━━ OUTPUT FORMAT ━━━
 
-NON-CUSTOMER EMAILS:
-Set is_customer_email = false for: supplier offers, spam, automated
-notifications, or any email that is clearly not from a real customer.
-
-OUTPUT FORMAT:
 Respond ONLY with valid JSON — no markdown, no extra text:
 {
   "is_customer_email": true,
   "should_auto_send": true,
   "sensitivity_reason": "",
-  "reply": "Full reply text here, including signature"
+  "reply": "Full reply text here, with short paragraphs and blank lines between them, ending with the signature"
 }
 """
 
 # ── Microsoft Graph helpers ───────────────────────────────────────────────────
 
 def get_token() -> str:
-    """Obtain an app-only access token via client credentials."""
     resp = requests.post(
         f"https://login.microsoftonline.com/{TENANT_ID}/oauth2/v2.0/token",
         data={
@@ -118,7 +201,6 @@ def get_token() -> str:
 
 
 def graph(method: str, path: str, token: str, **kwargs):
-    """Generic Microsoft Graph request."""
     headers = kwargs.pop("headers", {})
     headers["Authorization"] = f"Bearer {token}"
     return requests.request(
@@ -135,14 +217,13 @@ def get_unread_inbox(token: str) -> list:
         "$filter": "isRead eq false",
         "$select": "id,subject,from,body,bodyPreview,receivedDateTime,conversationId",
         "$orderby": "receivedDateTime asc",
-        "$top":     25,
+        "$top":     50,
     })
     resp.raise_for_status()
     return resp.json().get("value", [])
 
 
 def already_replied(token: str, conversation_id: str, received_dt: str) -> bool:
-    """Return True if we sent a message in this conversation after received_dt."""
     resp = graph("GET", f"/users/{MAILBOX_USER}/mailFolders/sentitems/messages", token, params={
         "$filter": f"conversationId eq '{conversation_id}'",
         "$select": "sentDateTime",
@@ -157,7 +238,6 @@ def already_replied(token: str, conversation_id: str, received_dt: str) -> bool:
 
 
 def draft_exists(token: str, conversation_id: str) -> bool:
-    """Return True if a draft already exists for this conversation."""
     resp = graph("GET", f"/users/{MAILBOX_USER}/mailFolders/drafts/messages", token, params={
         "$filter": f"conversationId eq '{conversation_id}'",
         "$select": "id",
@@ -191,7 +271,6 @@ def create_draft_reply(token: str, message_id: str, reply_text: str):
 # ── Utilities ─────────────────────────────────────────────────────────────────
 
 def strip_html(html: str) -> str:
-    """Very lightweight HTML to plain-text conversion."""
     text = re.sub(r"<br\s*/?>", "\n", html, flags=re.IGNORECASE)
     text = re.sub(r"<[^>]+>", "", text)
     text = re.sub(r"&nbsp;", " ", text)
@@ -202,9 +281,14 @@ def strip_html(html: str) -> str:
     return text.strip()
 
 
+def parse_dt(dt_str: str) -> datetime:
+    return datetime.fromisoformat(dt_str.replace("Z", "+00:00"))
+
+
 # ── Claude integration ────────────────────────────────────────────────────────
 
 def ask_claude(subject: str, body: str, sender: str) -> dict:
+    """Call Claude API. Raises exception on failure — caller must NOT mark email as read."""
     client = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
 
     message = client.messages.create(
@@ -223,7 +307,6 @@ def ask_claude(subject: str, body: str, sender: str) -> dict:
 
     raw = message.content[0].text.strip()
 
-    # Strip accidental markdown code fences
     if raw.startswith("```"):
         parts = raw.split("```")
         raw = parts[1] if len(parts) > 1 else raw
@@ -240,6 +323,7 @@ def main():
     print(f"\n{'='*60}")
     print(f"Email Worker — {ts}")
     print(f"Mailbox: {MAILBOX_USER}")
+    print(f"Cutoff:  {CUTOFF_DATE.isoformat()}")
     print(f"{'='*60}")
 
     token  = get_token()
@@ -247,9 +331,10 @@ def main():
     print(f"Unread emails found: {len(emails)}")
 
     for email in emails:
-        sender_address = email["from"]["emailAddress"]["address"].lower()
-        sender_domain  = sender_address.split("@")[-1]
-        subject        = email.get("subject", "(no subject)")
+        sender_obj     = email["from"]["emailAddress"]
+        sender_address = sender_obj.get("address", "").lower()
+        sender_domain  = sender_address.split("@")[-1] if "@" in sender_address else ""
+        subject        = email.get("subject") or "(no subject)"
         body_obj       = email.get("body", {})
         body_raw       = body_obj.get("content", email.get("bodyPreview", ""))
         body_text      = strip_html(body_raw) if body_obj.get("contentType") == "html" else body_raw
@@ -257,30 +342,37 @@ def main():
         msg_id         = email["id"]
         received_dt    = email["receivedDateTime"]
 
-        print(f"\n-> '{subject}' | from: {sender_address}")
+        print(f"\n-> '{subject}' | from: {sender_address} | received: {received_dt}")
 
-        # Skip non-customer senders
+        # ── Skip emails older than cutoff (do NOT mark as read) ──
+        msg_time = parse_dt(received_dt)
+        if msg_time < CUTOFF_DATE:
+            print("  Skipped — older than cutoff (not marked read)")
+            continue
+
+        # ── Skip non-customer senders (mark as read to clean inbox) ──
         if sender_domain in SKIP_SENDERS or sender_address in SKIP_SENDERS:
             print("  Skipped — non-customer sender")
             mark_read(token, msg_id)
             continue
 
-        # Skip if already replied
+        # ── Skip if already replied ──
         if already_replied(token, conv_id, received_dt):
             print("  Skipped — already replied")
             mark_read(token, msg_id)
             continue
 
-        # Skip if draft already exists
+        # ── Skip if draft already exists for this conversation ──
         if draft_exists(token, conv_id):
             print("  Skipped — draft already exists")
             continue
 
-        # Ask Claude
+        # ── Ask Claude (do NOT mark as read if this fails) ──
         try:
             result = ask_claude(subject, body_text, sender_address)
         except Exception as exc:
-            print(f"  ERROR - Claude: {exc}")
+            print(f"  ERROR — Claude API failed: {exc}")
+            print("  Email NOT marked as read (will retry next cycle)")
             continue
 
         if not result.get("is_customer_email", True):
@@ -296,14 +388,14 @@ def main():
                 mark_read(token, msg_id)
                 print("  AUTO-REPLY SENT")
             except Exception as exc:
-                print(f"  ERROR sending reply: {exc}")
+                print(f"  ERROR — failed to send reply: {exc}")
         else:
             try:
                 create_draft_reply(token, msg_id, reply_text)
-                reason = result.get("sensitivity_reason", "sensitive case")
+                reason = result.get("sensitivity_reason", "requires review")
                 print(f"  DRAFT SAVED — reason: {reason}")
             except Exception as exc:
-                print(f"  ERROR creating draft: {exc}")
+                print(f"  ERROR — failed to create draft: {exc}")
 
     print(f"\nWorker finished — {datetime.now(timezone.utc).isoformat()}")
 
