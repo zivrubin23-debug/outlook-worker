@@ -18,14 +18,14 @@ from urllib.parse import urlparse, parse_qs, quote
 
 # ── Configuration ─────────────────────────────────────────────────────────────
 
-CLIENT_ID        = os.environ["MS365_MCP_CLIENT_ID"]
-CLIENT_SECRET    = os.environ["MS365_MCP_CLIENT_SECRET"]
-TENANT_ID        = os.environ["MS365_MCP_TENANT_ID"]
-ANTHROPIC_KEY    = os.environ["ANTHROPIC_API_KEY"]
-MAILBOX_USER     = os.environ["MAILBOX_USER"]
+CLIENT_ID             = os.environ["MS365_MCP_CLIENT_ID"]
+CLIENT_SECRET         = os.environ["MS365_MCP_CLIENT_SECRET"]
+TENANT_ID             = os.environ["MS365_MCP_TENANT_ID"]
+ANTHROPIC_KEY         = os.environ["ANTHROPIC_API_KEY"]
+MAILBOX_USER          = os.environ["MAILBOX_USER"]
 SHOPIFY_CLIENT_ID     = os.environ["SHOPIFY_CLIENT_ID"]
 SHOPIFY_CLIENT_SECRET = os.environ["SHOPIFY_CLIENT_SECRET"]
-SHOPIFY_LOCATION = os.environ.get("SHOPIFY_LOCATION_ID", "")
+SHOPIFY_LOCATION      = os.environ.get("SHOPIFY_LOCATION_ID", "")
 
 SHOPIFY_STORE   = "40026a.myshopify.com"
 SHOPIFY_VERSION = "2024-01"
@@ -313,7 +313,6 @@ def save_reply_draft(token: str, message_id: str, reply_text: str):
 # ── Shopify Auth ──────────────────────────────────────────────────────────────
 
 def get_shopify_token() -> str:
-    """Obtain a Shopify access token via client credentials grant."""
     resp = requests.post(
         f"https://{SHOPIFY_STORE}/admin/oauth/access_token",
         data={
@@ -352,19 +351,6 @@ def shopify_post(path: str, data: dict, shopify_token: str) -> dict:
     )
     resp.raise_for_status()
     return resp.json()
-
-
-def log_shopify_locations(shopify_token: str):
-    """Log all locations so owner can copy SHOPIFY_LOCATION_ID into Railway."""
-    try:
-        locations = shopify_get("locations.json", shopify_token).get("locations", [])
-        print(f"\n📍 SHOPIFY LOCATIONS ({len(locations)} found):")
-        for loc in locations:
-            print(f"   ID: {loc['id']} | Name: {loc['name']} | Active: {loc['active']}")
-        if locations:
-            print(f"\n   ➡️  Add to Railway env: SHOPIFY_LOCATION_ID={locations[0]['id']}")
-    except Exception as exc:
-        print(f"   ERROR fetching locations: {exc}")
 
 # ── Shopify fulfillment helpers ───────────────────────────────────────────────
 
@@ -422,8 +408,8 @@ def find_unfulfilled_order(customer_name: str, shopify_token: str) -> dict:
         if not customers:
             return {}
 
-        name_lower = customer_name.strip().lower()
-        matched_id = None
+        name_lower  = customer_name.strip().lower()
+        matched_id  = None
 
         for c in customers:
             full = f"{c.get('first_name','')} {c.get('last_name','')}".strip().lower()
@@ -676,7 +662,6 @@ def main():
 
     ms_token = get_ms_token()
 
-    # ── Shopify token via client credentials ──
     print("\nAuthenticating with Shopify...")
     try:
         shopify_token = get_shopify_token()
@@ -686,11 +671,6 @@ def main():
         print("Skipping supplier workflow. Customer emails will still be processed.")
         shopify_token = None
 
-    # ── Log locations until SHOPIFY_LOCATION_ID is set ──
-    if shopify_token and not SHOPIFY_LOCATION:
-        log_shopify_locations(shopify_token)
-
-    # ── Run workflows ──
     if shopify_token:
         process_supplier_emails(ms_token, shopify_token)
 
