@@ -400,20 +400,31 @@ def extract_supplier_email_data(body_text: str) -> dict:
 
 def find_unfulfilled_order(customer_name: str, shopify_token: str) -> dict:
     try:
+        name_parts = customer_name.strip().split()
+
+        # If supplier sent duplicate name (e.g., "Fajardo Fajardo"),
+        # the customer only has one name — search by that single name only.
+        if len(name_parts) == 2 and name_parts[0].lower() == name_parts[1].lower():
+            search_query = name_parts[0]
+            print(f"   Duplicate name detected — searching as single name: '{search_query}'")
+        else:
+            search_query = customer_name.strip()
+
         customers = shopify_get(
-            f"customers/search.json?query={quote(customer_name)}&limit=10&fields=id,first_name,last_name",
+            f"customers/search.json?query={quote(search_query)}&limit=10&fields=id,first_name,last_name",
             shopify_token,
         ).get("customers", [])
 
         if not customers:
             return {}
 
-        name_lower = customer_name.strip().lower()
+        name_lower = search_query.lower()
         matched_id = None
 
         for c in customers:
-            full = f"{c.get('first_name','')} {c.get('last_name','')}".strip().lower()
-            if full == name_lower:
+            first = (c.get("first_name") or "").strip().lower()
+            last  = (c.get("last_name")  or "").strip().lower()
+            if first == name_lower or last == name_lower:
                 matched_id = c["id"]
                 break
 
