@@ -408,8 +408,8 @@ def find_unfulfilled_order(customer_name: str, shopify_token: str) -> dict:
         if not customers:
             return {}
 
-        name_lower  = customer_name.strip().lower()
-        matched_id  = None
+        name_lower = customer_name.strip().lower()
+        matched_id = None
 
         for c in customers:
             full = f"{c.get('first_name','')} {c.get('last_name','')}".strip().lower()
@@ -485,7 +485,7 @@ def parse_dt(dt_str: str) -> datetime:
 def ask_claude(subject: str, body: str, sender: str) -> dict:
     client = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
     message = client.messages.create(
-        model="claude-3-5-haiku-20241022",
+        model="claude-sonnet-4-5",
         max_tokens=1500,
         system=SYSTEM_PROMPT,
         messages=[{"role": "user", "content": f"From: {sender}\nSubject: {subject}\n\nBody:\n{body}"}],
@@ -657,7 +657,7 @@ def main():
     print(f"Mailbox:  {MAILBOX_USER}")
     print(f"Shopify:  {SHOPIFY_STORE}")
     print(f"Cutoff:   {CUTOFF_DATE.isoformat()}")
-    print(f"Model:    claude-3-5-haiku-20241022")
+    print(f"Model:    claude-sonnet-4-5")
     print(f"{'='*60}")
 
     ms_token = get_ms_token()
