@@ -2,12 +2,6 @@
 """
 My Secret Sex Toy Delivery — Automated Email Support Worker
 Railway Cron Job — runs every 30 minutes
-
-Optimizations:
-  - Pre-filter skips obvious spam/marketing before Claude
-  - Haiku for classification, Sonnet only for reply generation
-  - Truncated email body (max 1500 chars) sent to Claude
-  - Short system prompt
 """
 
 import os
@@ -39,8 +33,6 @@ SUPPLIER_FOLDER_ID = "AAMkADBhNDBkMzJjLWRiZTMtNDE2NC1iNDQ1LTQ4ZjVlMWE3ZGFkYwAuAA
 TELEGRAM_TOKEN   = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 
-# ── Pre-filter: skip without Claude ──────────────────────────────────────────
-
 SKIP_SENDERS = {
     "funnymee.com", "163.com", "bezlya.com",
     "info@mysecretsextoydelivery.com",
@@ -52,7 +44,6 @@ SKIP_SENDERS = {
     "melodeem.com", "blq.com", "vscnovelty.com", "cucupie.com",
     "purepleasure-4.com", "fairyl.com", "foxmail.com", "adamssceptre.com",
     "getsweetums.com", "miamidistro1.com", "tabs.co", "swisstransfer.com",
-    "shop.tiktok.com", "lovetoyus.com", "entervending.com",
     "mail.zapier.com", "buddify.app", "creativeoutdoor.com",
 }
 
@@ -69,12 +60,10 @@ SKIP_SUBJECT_KEYWORDS = {
 
 
 def should_skip_without_claude(subject: str, body_preview: str) -> bool:
-    """Return True if email is obviously not a real customer — skip Claude."""
     s = (subject or "").lower()
     b = (body_preview or "")[:300].lower()
     return any(kw in s or kw in b for kw in SKIP_SUBJECT_KEYWORDS)
 
-# ── System Prompts (short) ────────────────────────────────────────────────────
 
 CLASSIFY_PROMPT = """You are a classifier for a sex toy delivery store's support inbox.
 
@@ -90,7 +79,7 @@ Reply warmly, professionally, discreetly. Same language as customer. Short parag
 POLICIES:
 - CANCELLATION: "We cannot guarantee cancellation as the order may already be with our shipping provider. We will check and update you."
 - TRACKING: Ask for order number if missing. If no tracking yet: "Your order is with our shipping provider. We'll send tracking as soon as we have it."
-- RETURNS: NEVER give return address. Say: "Reply and we'll arrange an RMA number and return instructions." → DRAFT only.
+- RETURNS: NEVER give return address. Say: "Reply and we'll arrange an RMA number and return instructions." DRAFT only.
 - REFUNDS: DRAFT only. Never confirm amounts.
 - NO PHYSICAL STORE: Online only.
 
@@ -110,7 +99,6 @@ Online Store: www.mysecretsextoydelivery.com
 Reply ONLY with JSON:
 {"should_auto_send": true/false, "sensitivity_reason": "", "reply": "full reply text with signature"}"""
 
-# ── HTML Formatting ───────────────────────────────────────────────────────────
 
 def format_reply_html(reply_text: str) -> str:
     MARKER = "___________________"
@@ -141,7 +129,6 @@ def format_reply_html(reply_text: str) -> str:
         f'{body_html}{sig_html}</body></html>'
     )
 
-# ── Notifications ─────────────────────────────────────────────────────────────
 
 def notify(message: str):
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
@@ -155,7 +142,6 @@ def notify(message: str):
     except Exception:
         pass
 
-# ── Microsoft Graph ───────────────────────────────────────────────────────────
 
 def get_ms_token() -> str:
     resp = requests.post(
@@ -227,7 +213,6 @@ def mark_read(token: str, message_id: str):
 
 
 def mark_failed(token: str, message_id: str):
-    """Tag email so we don't retry forever."""
     graph("PATCH", f"/users/{MAILBOX_USER}/messages/{message_id}", token,
           headers={"Content-Type": "application/json"},
           json={"categories": ["worker-failed"]})
@@ -263,7 +248,6 @@ def save_reply_draft(token: str, message_id: str, reply_text: str):
     draft_id = create_reply_draft(token, message_id)
     update_draft_body(token, draft_id, format_reply_html(reply_text))
 
-# ── Shopify ───────────────────────────────────────────────────────────────────
 
 def get_shopify_token() -> str:
     resp = requests.post(
@@ -298,7 +282,6 @@ def shopify_post(path: str, data: dict, shopify_token: str) -> dict:
     resp.raise_for_status()
     return resp.json()
 
-# ── Supplier email helpers ────────────────────────────────────────────────────
 
 def detect_carrier(url: str) -> str:
     u = url.lower()
@@ -419,7 +402,6 @@ def create_fulfillment(order_id: int, tracking_number: str,
         print(f"   ERROR creating fulfillment: {exc}")
         return False
 
-# ── Utilities ─────────────────────────────────────────────────────────────────
 
 def strip_html(html: str) -> str:
     text = re.sub(r"<br\s*/?>", "\n", html, flags=re.IGNORECASE)
@@ -434,15 +416,12 @@ def parse_dt(dt_str: str) -> datetime:
 
 
 def truncate_body(text: str, max_chars: int = 1500) -> str:
-    """Limit email body to reduce Claude token usage."""
     if len(text) <= max_chars:
         return text
     return text[:max_chars] + "\n[... truncated]"
 
-# ── Claude (two-stage) ────────────────────────────────────────────────────────
 
 def classify_email(subject: str, body: str, sender: str) -> dict:
-    """Stage 1: Haiku — cheap classification only."""
     client = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
     message = client.messages.create(
         model="claude-haiku-4-5",
@@ -450,7 +429,7 @@ def classify_email(subject: str, body: str, sender: str) -> dict:
         system=CLASSIFY_PROMPT,
         messages=[{
             "role": "user",
-            "content": f"From: {sender}\nSubject: {subject}\n\nBody (first 500 chars):\n{body[:500]}"
+            "content": f"From: {sender}\nSubject: {subject}\n\nBody:\n{body[:500]}"
         }],
     )
     raw = message.content[0].text.strip()
@@ -463,7 +442,6 @@ def classify_email(subject: str, body: str, sender: str) -> dict:
 
 
 def generate_reply(subject: str, body: str, sender: str) -> dict:
-    """Stage 2: Sonnet — full reply generation (only for real customers)."""
     client = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
     message = client.messages.create(
         model="claude-sonnet-4-5",
@@ -482,7 +460,6 @@ def generate_reply(subject: str, body: str, sender: str) -> dict:
             raw = raw[4:]
     return json.loads(raw.strip())
 
-# ── Workflow 1: Supplier tracking ─────────────────────────────────────────────
 
 def process_supplier_emails(ms_token: str, shopify_token: str):
     print(f"\n{'─'*60}")
@@ -545,7 +522,6 @@ def process_supplier_emails(ms_token: str, shopify_token: str):
             print(f"   ❌ Fulfillment failed — not marked read")
             notify(f"❌ <b>Fulfillment failed</b>\nCustomer: {customer_name} | Order: {order_name}")
 
-# ── Workflow 2: Customer support ──────────────────────────────────────────────
 
 def process_customer_emails(ms_token: str):
     print(f"\n{'─'*60}")
@@ -555,9 +531,9 @@ def process_customer_emails(ms_token: str):
     emails = get_unread_inbox(ms_token)
     print(f"Unread inbox emails: {len(emails)}")
 
-    skipped_prefilter  = 0
+    skipped_prefilter   = 0
     skipped_noncustomer = 0
-    processed          = 0
+    processed           = 0
 
     for email in emails:
         sender_address = email["from"]["emailAddress"].get("address", "").lower()
@@ -578,21 +554,18 @@ def process_customer_emails(ms_token: str):
             print("   Skipped — older than cutoff")
             continue
 
-        # Skip if previously failed
         if "worker-failed" in categories:
-            print("   Skipped — previously failed, needs manual review")
+            print("   Skipped — previously failed")
             continue
 
-        # Pre-filter: known non-customer senders
         if sender_domain in SKIP_SENDERS or sender_address in SKIP_SENDERS:
             print("   Skipped — known non-customer sender")
             mark_read(ms_token, msg_id)
             skipped_prefilter += 1
             continue
 
-        # Pre-filter: obvious non-customer subjects/content
         if should_skip_without_claude(subject, body_preview):
-            print("   Skipped — pre-filter (no Claude used)")
+            print("   Skipped — pre-filter")
             mark_read(ms_token, msg_id)
             skipped_prefilter += 1
             continue
@@ -606,28 +579,27 @@ def process_customer_emails(ms_token: str):
             print("   Skipped — draft already exists")
             continue
 
-        # Stage 1: Haiku classification (cheap)
         body_truncated = truncate_body(body_text)
+
         try:
             classification = classify_email(subject, body_truncated, sender_address)
         except Exception as exc:
-            print(f"   ERROR — Haiku classification failed: {exc}")
+            print(f"   ERROR — Haiku failed: {exc}")
             mark_failed(ms_token, msg_id)
             continue
 
         if not classification.get("is_customer_email", False):
-            print(f"   Skipped — not a customer email (Haiku)")
+            print("   Skipped — not a customer email (Haiku)")
             mark_read(ms_token, msg_id)
             skipped_noncustomer += 1
             continue
 
-        print(f"   Customer email detected: {classification.get('email_type', 'other')}")
+        print(f"   Customer email: {classification.get('email_type', 'other')}")
 
-        # Stage 2: Sonnet reply generation (only for real customers)
         try:
             result = generate_reply(subject, body_truncated, sender_address)
         except Exception as exc:
-            print(f"   ERROR — Sonnet reply failed: {exc}")
+            print(f"   ERROR — Sonnet failed: {exc}")
             mark_failed(ms_token, msg_id)
             continue
 
@@ -651,9 +623,8 @@ def process_customer_emails(ms_token: str):
             except Exception as exc:
                 print(f"   ERROR saving draft: {exc}")
 
-    print(f"\n   Summary: {skipped_prefilter} pre-filtered | {skipped_noncustomer} non-customer (Haiku) | {processed} processed (Sonnet)")
+    print(f"\n   Summary: {skipped_prefilter} pre-filtered | {skipped_noncustomer} non-customer | {processed} processed")
 
-# ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
     ts = datetime.now(timezone.utc).isoformat()
@@ -686,12 +657,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-גם עדכן את railway.toml:
-[build]
-builder = "NIXPACKS"
-
-[deploy]
-startCommand = "python worker.py"
-cronSchedule = "*/30 * * * *"
-restartPolicyType = "NEVER"

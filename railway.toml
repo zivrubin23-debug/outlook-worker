@@ -3,5 +3,5 @@ builder = "NIXPACKS"
 
 [deploy]
 startCommand = "python worker.py"
-cronSchedule = "*/5 * * * *"
+cronSchedule = "*/30 * * * *"
 restartPolicyType = "NEVER"
