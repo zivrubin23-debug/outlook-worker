@@ -1,7 +1,13 @@
 #!/usr/bin/env python3
 """
 My Secret Sex Toy Delivery — Automated Email Support Worker
-Railway Cron Job — runs every 5 minutes
+Railway Cron Job — runs every 30 minutes
+
+Optimizations:
+  - Pre-filter skips obvious spam/marketing before Claude
+  - Haiku for classification, Sonnet only for reply generation
+  - Truncated email body (max 1500 chars) sent to Claude
+  - Short system prompt
 """
 
 import os
@@ -10,7 +16,7 @@ import re
 import requests
 import anthropic
 from datetime import datetime, timezone
-from urllib.parse import urlparse, parse_qs, quote
+from urllib.parse import urlparse, parse_qs
 
 # ── Configuration ─────────────────────────────────────────────────────────────
 
@@ -33,10 +39,12 @@ SUPPLIER_FOLDER_ID = "AAMkADBhNDBkMzJjLWRiZTMtNDE2NC1iNDQ1LTQ4ZjVlMWE3ZGFkYwAuAA
 TELEGRAM_TOKEN   = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 
+# ── Pre-filter: skip without Claude ──────────────────────────────────────────
+
 SKIP_SENDERS = {
     "funnymee.com", "163.com", "bezlya.com",
     "info@mysecretsextoydelivery.com",
-    "mailer@klaviyo.com", "hello.klaviyo.com",
+    "klaviyo.com", "hello.klaviyo.com",
     "shop.tiktok.com", "taylor@shop.tiktok.com", "sam@shop.tiktok.com",
     "partners@buddify.app", "brand.faire.com", "entervending.com",
     "sextoydistributing.com", "lovetoyus.com", "info-dysotoys.com",
@@ -44,91 +52,52 @@ SKIP_SENDERS = {
     "melodeem.com", "blq.com", "vscnovelty.com", "cucupie.com",
     "purepleasure-4.com", "fairyl.com", "foxmail.com", "adamssceptre.com",
     "getsweetums.com", "miamidistro1.com", "tabs.co", "swisstransfer.com",
+    "shop.tiktok.com", "lovetoyus.com", "entervending.com",
+    "mail.zapier.com", "buddify.app", "creativeoutdoor.com",
 }
 
-SYSTEM_PROMPT = """
-You are an automated customer support agent for My Secret Sex Toy Delivery
-(mysecretsextoydelivery.com).
+SKIP_SUBJECT_KEYWORDS = {
+    "newsletter", "unsubscribe", "webinar", "live training",
+    "affiliate", "% off", "promo", "coupon", "overstock",
+    "new arrivals", "hot sellers", "tiktok shop", "free ads",
+    "your first 60 days", "automatic reply", "out of office",
+    "undeliverable", "delivery failure", "data deletion",
+    "scale global", "drive revenue", "klaviyo", "buddify",
+    "shopify markets", "integration spotlight", "new products",
+    "brand new", "shop now", "view as webpage",
+}
 
-━━━ TONE & STYLE ━━━
-- Warm, professional, and discreet
-- Friendly but never overly casual
-- Short paragraphs with a blank line between them for readability
-- Always reply in the SAME LANGUAGE the customer wrote in
-- Never mention internal systems, supplier names, or costs
 
-━━━ STEP 1 — IS THIS A REAL CUSTOMER EMAIL? ━━━
+def should_skip_without_claude(subject: str, body_preview: str) -> bool:
+    """Return True if email is obviously not a real customer — skip Claude."""
+    s = (subject or "").lower()
+    b = (body_preview or "")[:300].lower()
+    return any(kw in s or kw in b for kw in SKIP_SUBJECT_KEYWORDS)
 
-Set is_customer_email = true ONLY if the email is clearly from a customer
-about an existing or potential order. This includes:
-- Order cancellation requests
-- Shipping / tracking / delivery questions
-- Address changes or corrections
-- Return or refund requests
-- Product questions from real shoppers
-- Complaints about a received or missing item
-- Questions about same-day / express delivery
-- Questions about whether there is a physical store
-- Shopify contact form messages (always real customers)
-- Any follow-up in an ongoing customer conversation
+# ── System Prompts (short) ────────────────────────────────────────────────────
 
-Set is_customer_email = false for:
-- Supplier offers, wholesale catalogs, manufacturer outreach
-- Marketing newsletters or platform notifications
-- Cold B2B outreach or partnership proposals
-- Spam or automated system emails
-- Sex advice questions with no order involved
+CLASSIFY_PROMPT = """You are a classifier for a sex toy delivery store's support inbox.
 
-When in doubt, set is_customer_email = false.
+Decide if an email is from a REAL CUSTOMER about an order (cancellation, tracking, shipping, return, refund, product question, complaint) OR not (spam, supplier, marketing, B2B).
 
-━━━ STEP 2 — AUTO-SEND vs DRAFT ━━━
+Reply ONLY with JSON:
+{"is_customer_email": true/false, "email_type": "cancellation|tracking|return|refund|complaint|product_question|other"}"""
 
-Set should_auto_send = true ONLY for:
-- Order status / tracking questions
-- Delivery timing questions (same day, express)
-- Physical store / pickup questions
-- Simple product questions
-- Address confirmation replies
-- Cancellation requests (use soft wording below)
+REPLY_PROMPT = """You are a customer support agent for My Secret Sex Toy Delivery (mysecretsextoydelivery.com).
 
-Set should_auto_send = false (DRAFT) for:
-- Any refund request or discussion
-- Any return request (never auto-send address — RMA required)
-- Dispute, chargeback, or credit card claim
-- Fraud / scam accusations
-- Legal threats
-- Package delivered but not received
-- Double charge or payment issues
-- Angry or aggressive language
-- Anything requiring judgment or investigation
+Reply warmly, professionally, discreetly. Same language as customer. Short paragraphs.
 
-━━━ KEY POLICIES ━━━
+POLICIES:
+- CANCELLATION: "We cannot guarantee cancellation as the order may already be with our shipping provider. We will check and update you."
+- TRACKING: Ask for order number if missing. If no tracking yet: "Your order is with our shipping provider. We'll send tracking as soon as we have it."
+- RETURNS: NEVER give return address. Say: "Reply and we'll arrange an RMA number and return instructions." → DRAFT only.
+- REFUNDS: DRAFT only. Never confirm amounts.
+- NO PHYSICAL STORE: Online only.
 
-CANCELLATIONS:
-  Soft wording only — never say impossible:
-  "We will do our best to help. Please note that we cannot guarantee
-  cancellation at this stage, as the order may already be with the
-  shipping provider. We will check and update you as soon as possible."
+DRAFT (should_auto_send=false) for: refunds, returns, disputes, chargebacks, angry/legal/fraud, package not received, double charges.
+AUTO-SEND for: tracking questions, cancellations, order status, product questions, store location.
 
-ORDER STATUS:
-  If no order number provided, ask politely.
-  If no tracking yet: "Your order has been passed to our shipping provider.
-  As soon as we receive the tracking number, we will send it to you."
-
-RETURNS:
-  NEVER include return address. Always say:
-  "Please reply and we will arrange an RMA number and return instructions."
-  Save as DRAFT.
-
-REFUNDS: Always DRAFT. Never confirm amounts automatically.
-
-NO PHYSICAL STORE:
-  "We are an online-only store. All orders ship directly to your address."
-
-━━━ EMAIL SIGNATURE ━━━
-
-Always include at the very end:
-
+SIGNATURE (always at end):
 ___________________
 
 Best regards,
@@ -138,26 +107,17 @@ Service Team Leader | MS
 
 Online Store: www.mysecretsextoydelivery.com
 
-━━━ OUTPUT FORMAT ━━━
-
-Respond ONLY with valid JSON — no markdown, no extra text:
-{
-  "is_customer_email": true,
-  "should_auto_send": true,
-  "sensitivity_reason": "",
-  "reply": "Full reply text, blank lines between paragraphs, ending with signature"
-}
-"""
+Reply ONLY with JSON:
+{"should_auto_send": true/false, "sensitivity_reason": "", "reply": "full reply text with signature"}"""
 
 # ── HTML Formatting ───────────────────────────────────────────────────────────
 
 def format_reply_html(reply_text: str) -> str:
-    SIGNATURE_MARKER = "___________________"
-    if SIGNATURE_MARKER in reply_text:
-        body_part, sig_part = reply_text.split(SIGNATURE_MARKER, 1)
+    MARKER = "___________________"
+    if MARKER in reply_text:
+        body_part, sig_part = reply_text.split(MARKER, 1)
     else:
-        body_part = reply_text
-        sig_part  = ""
+        body_part, sig_part = reply_text, ""
 
     body_html = ""
     for para in re.split(r"\n{2,}", body_part.strip()):
@@ -173,13 +133,11 @@ def format_reply_html(reply_text: str) -> str:
         )
         sig_html = (
             '<hr style="border:none;border-top:1px solid #ccc;margin:16px 0;">\n'
-            '<p style="color:#555;font-size:13px;line-height:1.6;">'
-            f'{sig_inner}</p>\n'
+            f'<p style="color:#555;font-size:13px;line-height:1.6;">{sig_inner}</p>\n'
         )
 
     return (
-        '<!DOCTYPE html><html><body '
-        'style="font-family:Arial,sans-serif;font-size:14px;color:#333;line-height:1.6;">\n'
+        '<!DOCTYPE html><html><body style="font-family:Arial,sans-serif;font-size:14px;color:#333;line-height:1.6;">\n'
         f'{body_html}{sig_html}</body></html>'
     )
 
@@ -223,7 +181,7 @@ def graph(method: str, path: str, token: str, **kwargs):
 def get_unread_inbox(token: str) -> list:
     resp = graph("GET", f"/users/{MAILBOX_USER}/mailFolders/inbox/messages", token, params={
         "$filter": "isRead eq false",
-        "$select": "id,subject,from,body,bodyPreview,receivedDateTime,conversationId",
+        "$select": "id,subject,from,body,bodyPreview,receivedDateTime,conversationId,categories",
         "$orderby": "receivedDateTime asc",
         "$top": 50,
     })
@@ -266,6 +224,13 @@ def draft_exists(token: str, conversation_id: str) -> bool:
 def mark_read(token: str, message_id: str):
     graph("PATCH", f"/users/{MAILBOX_USER}/messages/{message_id}", token,
           headers={"Content-Type": "application/json"}, json={"isRead": True})
+
+
+def mark_failed(token: str, message_id: str):
+    """Tag email so we don't retry forever."""
+    graph("PATCH", f"/users/{MAILBOX_USER}/messages/{message_id}", token,
+          headers={"Content-Type": "application/json"},
+          json={"categories": ["worker-failed"]})
 
 
 def create_reply_draft(token: str, message_id: str) -> str:
@@ -389,7 +354,6 @@ def extract_supplier_email_data(body_text: str, body_raw: str = "") -> dict:
 def find_unfulfilled_order(customer_name: str, shopify_token: str) -> dict:
     try:
         name_parts = customer_name.strip().split()
-
         if len(name_parts) == 2 and name_parts[0].lower() == name_parts[1].lower():
             search_name = name_parts[0].lower()
             print(f"   Duplicate name — searching as: '{search_name}'")
@@ -407,7 +371,6 @@ def find_unfulfilled_order(customer_name: str, shopify_token: str) -> dict:
             first = (customer.get("first_name") or "").strip().lower()
             last  = (customer.get("last_name")  or "").strip().lower()
             full  = f"{first} {last}".strip()
-
             if first == search_name or last == search_name or full == search_name:
                 return order
 
@@ -423,8 +386,7 @@ def create_fulfillment(order_id: int, tracking_number: str,
                        shopify_token: str) -> bool:
     try:
         fulfillment_orders = shopify_get(
-            f"orders/{order_id}/fulfillment_orders.json",
-            shopify_token,
+            f"orders/{order_id}/fulfillment_orders.json", shopify_token,
         ).get("fulfillment_orders", [])
 
         open_fos = [fo for fo in fulfillment_orders if fo["status"] == "open"]
@@ -470,15 +432,47 @@ def strip_html(html: str) -> str:
 def parse_dt(dt_str: str) -> datetime:
     return datetime.fromisoformat(dt_str.replace("Z", "+00:00"))
 
-# ── Claude ────────────────────────────────────────────────────────────────────
 
-def ask_claude(subject: str, body: str, sender: str) -> dict:
+def truncate_body(text: str, max_chars: int = 1500) -> str:
+    """Limit email body to reduce Claude token usage."""
+    if len(text) <= max_chars:
+        return text
+    return text[:max_chars] + "\n[... truncated]"
+
+# ── Claude (two-stage) ────────────────────────────────────────────────────────
+
+def classify_email(subject: str, body: str, sender: str) -> dict:
+    """Stage 1: Haiku — cheap classification only."""
+    client = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
+    message = client.messages.create(
+        model="claude-haiku-4-5",
+        max_tokens=100,
+        system=CLASSIFY_PROMPT,
+        messages=[{
+            "role": "user",
+            "content": f"From: {sender}\nSubject: {subject}\n\nBody (first 500 chars):\n{body[:500]}"
+        }],
+    )
+    raw = message.content[0].text.strip()
+    if raw.startswith("```"):
+        parts = raw.split("```")
+        raw = parts[1] if len(parts) > 1 else raw
+        if raw.lower().startswith("json"):
+            raw = raw[4:]
+    return json.loads(raw.strip())
+
+
+def generate_reply(subject: str, body: str, sender: str) -> dict:
+    """Stage 2: Sonnet — full reply generation (only for real customers)."""
     client = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
     message = client.messages.create(
         model="claude-sonnet-4-5",
-        max_tokens=1500,
-        system=SYSTEM_PROMPT,
-        messages=[{"role": "user", "content": f"From: {sender}\nSubject: {subject}\n\nBody:\n{body}"}],
+        max_tokens=1000,
+        system=REPLY_PROMPT,
+        messages=[{
+            "role": "user",
+            "content": f"From: {sender}\nSubject: {subject}\n\nBody:\n{body}"
+        }],
     )
     raw = message.content[0].text.strip()
     if raw.startswith("```"):
@@ -561,26 +555,46 @@ def process_customer_emails(ms_token: str):
     emails = get_unread_inbox(ms_token)
     print(f"Unread inbox emails: {len(emails)}")
 
+    skipped_prefilter  = 0
+    skipped_noncustomer = 0
+    processed          = 0
+
     for email in emails:
         sender_address = email["from"]["emailAddress"].get("address", "").lower()
         sender_domain  = sender_address.split("@")[-1] if "@" in sender_address else ""
-        subject        = email.get("subject") or "(no subject)"
+        subject        = email.get("subject") or ""
         body_obj       = email.get("body", {})
         body_raw       = body_obj.get("content", email.get("bodyPreview", ""))
         body_text      = strip_html(body_raw) if body_obj.get("contentType") == "html" else body_raw
+        body_preview   = email.get("bodyPreview", "")
         conv_id        = email["conversationId"]
         msg_id         = email["id"]
         received_dt    = email["receivedDateTime"]
+        categories     = email.get("categories", [])
 
-        print(f"\n-> '{subject}' | from: {sender_address} | {received_dt}")
+        print(f"\n-> '{subject}' | from: {sender_address}")
 
         if parse_dt(received_dt) < CUTOFF_DATE:
             print("   Skipped — older than cutoff")
             continue
 
+        # Skip if previously failed
+        if "worker-failed" in categories:
+            print("   Skipped — previously failed, needs manual review")
+            continue
+
+        # Pre-filter: known non-customer senders
         if sender_domain in SKIP_SENDERS or sender_address in SKIP_SENDERS:
-            print("   Skipped — non-customer sender")
+            print("   Skipped — known non-customer sender")
             mark_read(ms_token, msg_id)
+            skipped_prefilter += 1
+            continue
+
+        # Pre-filter: obvious non-customer subjects/content
+        if should_skip_without_claude(subject, body_preview):
+            print("   Skipped — pre-filter (no Claude used)")
+            mark_read(ms_token, msg_id)
+            skipped_prefilter += 1
             continue
 
         if already_replied(ms_token, conv_id, received_dt):
@@ -592,18 +606,33 @@ def process_customer_emails(ms_token: str):
             print("   Skipped — draft already exists")
             continue
 
+        # Stage 1: Haiku classification (cheap)
+        body_truncated = truncate_body(body_text)
         try:
-            result = ask_claude(subject, body_text, sender_address)
+            classification = classify_email(subject, body_truncated, sender_address)
         except Exception as exc:
-            print(f"   ERROR — Claude failed: {exc}")
+            print(f"   ERROR — Haiku classification failed: {exc}")
+            mark_failed(ms_token, msg_id)
             continue
 
-        if not result.get("is_customer_email", True):
-            print("   Skipped — not a customer email")
+        if not classification.get("is_customer_email", False):
+            print(f"   Skipped — not a customer email (Haiku)")
             mark_read(ms_token, msg_id)
+            skipped_noncustomer += 1
+            continue
+
+        print(f"   Customer email detected: {classification.get('email_type', 'other')}")
+
+        # Stage 2: Sonnet reply generation (only for real customers)
+        try:
+            result = generate_reply(subject, body_truncated, sender_address)
+        except Exception as exc:
+            print(f"   ERROR — Sonnet reply failed: {exc}")
+            mark_failed(ms_token, msg_id)
             continue
 
         reply_text = result.get("reply", "")
+        processed += 1
 
         if result.get("should_auto_send"):
             try:
@@ -622,6 +651,8 @@ def process_customer_emails(ms_token: str):
             except Exception as exc:
                 print(f"   ERROR saving draft: {exc}")
 
+    print(f"\n   Summary: {skipped_prefilter} pre-filtered | {skipped_noncustomer} non-customer (Haiku) | {processed} processed (Sonnet)")
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
@@ -631,7 +662,6 @@ def main():
     print(f"Mailbox:  {MAILBOX_USER}")
     print(f"Shopify:  {SHOPIFY_STORE}")
     print(f"Cutoff:   {CUTOFF_DATE.isoformat()}")
-    print(f"Model:    claude-sonnet-4-5")
     print(f"{'='*60}")
 
     ms_token = get_ms_token()
@@ -656,3 +686,12 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+גם עדכן את railway.toml:
+[build]
+builder = "NIXPACKS"
+
+[deploy]
+startCommand = "python worker.py"
+cronSchedule = "*/30 * * * *"
+restartPolicyType = "NEVER"
