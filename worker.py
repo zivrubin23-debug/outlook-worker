@@ -380,19 +380,35 @@ def extract_tracking_number(tracking_url: str, carrier: str) -> str:
     return ""
 
 
-def extract_supplier_email_data(body_text: str) -> dict:
+def extract_supplier_email_data(body_text: str, body_raw: str = "") -> dict:
+    """
+    Extract customer name and tracking URL from supplier email.
+
+    Searches both raw body (preserves href links in HTML emails)
+    and stripped text (handles plain-text emails with <url> format).
+    """
+    # Customer name
     name_match = re.search(r"Hi\s+(.+?),\s+your order has shipped", body_text, re.IGNORECASE)
     customer_name = name_match.group(1).strip() if name_match else ""
 
-    tracking_url = ""
     carrier_domains = [
         "tools.usps.com", "usps.com/go",
         "fedex.com/fedextrack", "fedex.com/tracking",
         "ups.com/track", "ontrac.com/tracking",
     ]
-    for url in re.findall(r'https?://[^\s\)\>\"\'\<]+', body_text):
-        if any(d in url.lower() for d in carrier_domains):
-            tracking_url = url.strip().rstrip(".")
+
+    tracking_url = ""
+
+    # Search raw body first (catches href in HTML), then stripped text
+    for source in [body_raw, body_text]:
+        if not source:
+            continue
+        for url in re.findall(r'https?://[^\s\)\>\"\'<\|]+', source):
+            url = url.strip().rstrip(".,;>")
+            if any(d in url.lower() for d in carrier_domains):
+                tracking_url = url
+                break
+        if tracking_url:
             break
 
     return {"customer_name": customer_name, "tracking_url": tracking_url}
@@ -402,11 +418,10 @@ def find_unfulfilled_order(customer_name: str, shopify_token: str) -> dict:
     try:
         name_parts = customer_name.strip().split()
 
-        # If supplier sent duplicate name (e.g., "Fajardo Fajardo"),
-        # the customer only has one name — search by that single name only.
+        # Duplicate name (e.g. "Fajardo Fajardo") → search single name
         if len(name_parts) == 2 and name_parts[0].lower() == name_parts[1].lower():
             search_query = name_parts[0]
-            print(f"   Duplicate name detected — searching as single name: '{search_query}'")
+            print(f"   Duplicate name — searching as: '{search_query}'")
         else:
             search_query = customer_name.strip()
 
@@ -453,6 +468,10 @@ def create_fulfillment(order_id: int, tracking_number: str,
             shopify_token,
         ).get("fulfillment_orders", [])
 
+        print(f"   Fulfillment orders: {len(fulfillment_orders)}")
+        for fo in fulfillment_orders:
+            print(f"     FO {fo['id']} status: {fo['status']}")
+
         open_fos = [fo for fo in fulfillment_orders if fo["status"] == "open"]
         if not open_fos:
             print(f"   No open fulfillment orders for order {order_id}")
@@ -472,7 +491,12 @@ def create_fulfillment(order_id: int, tracking_number: str,
             }
         }, shopify_token)
 
-        return "fulfillment" in result
+        if "fulfillment" in result:
+            f = result["fulfillment"]
+            print(f"   Fulfillment ID: {f.get('id')} | status: {f.get('status')}")
+            return True
+
+        return False
 
     except Exception as exc:
         print(f"   ERROR creating fulfillment: {exc}")
@@ -533,7 +557,8 @@ def process_supplier_emails(ms_token: str, shopify_token: str):
             print("   Skipped — older than cutoff (not marked read)")
             continue
 
-        data          = extract_supplier_email_data(body_text)
+        # Pass BOTH raw and stripped — raw preserves href links in HTML emails
+        data          = extract_supplier_email_data(body_text, body_raw)
         customer_name = data["customer_name"]
         tracking_url  = data["tracking_url"]
 
@@ -551,16 +576,16 @@ def process_supplier_emails(ms_token: str, shopify_token: str):
         print(f"   Customer:  {customer_name}")
         print(f"   Carrier:   {carrier}")
         print(f"   Tracking:  {tracking_number}")
+        print(f"   URL:       {tracking_url}")
 
         order = find_unfulfilled_order(customer_name, shopify_token)
         if not order:
-            print(f"   WARNING — No unfulfilled order found for '{customer_name}'")
-            print("   Not marking as read — needs manual check")
+            print(f"   WARNING — No unfulfilled order for '{customer_name}' — not marked read")
             notify(
-                f"⚠️ <b>Tracking not matched</b>\n"
+                f"⚠️ <b>No order match</b>\n"
                 f"Customer: {customer_name}\n"
-                f"Carrier: {carrier} | {tracking_number}\n"
-                f"No unfulfilled Shopify order found — manual action needed"
+                f"{carrier} | {tracking_number}\n"
+                f"Manual action needed"
             )
             continue
 
@@ -568,23 +593,24 @@ def process_supplier_emails(ms_token: str, shopify_token: str):
         order_id   = order["id"]
         print(f"   Shopify order: {order_name} (ID: {order_id})")
 
-        success = create_fulfillment(order_id, tracking_number, tracking_url, carrier, shopify_token)
+        success = create_fulfillment(
+            order_id, tracking_number, tracking_url, carrier, shopify_token
+        )
 
         if success:
             mark_read(ms_token, msg_id)
-            print(f"   ✅ Fulfillment created — Shopify will notify customer")
+            print(f"   ✅ Fulfilled — customer will receive tracking email")
             notify(
-                f"📦 <b>Tracking updated</b>\n"
-                f"Customer: {customer_name}\n"
-                f"Order: {order_name}\n"
-                f"Carrier: {carrier} | {tracking_number}"
+                f"📦 <b>Fulfilled</b>\n"
+                f"Customer: {customer_name} | Order: {order_name}\n"
+                f"{carrier} | {tracking_number}"
             )
         else:
-            print(f"   ❌ Fulfillment failed — not marking as read")
+            print(f"   ❌ Fulfillment failed — not marked read")
             notify(
                 f"❌ <b>Fulfillment failed</b>\n"
                 f"Customer: {customer_name} | Order: {order_name}\n"
-                f"Manual action needed"
+                f"Check Railway logs"
             )
 
 # ── Workflow 2: Customer support emails ───────────────────────────────────────
@@ -679,7 +705,7 @@ def main():
         print("Shopify token: OK")
     except Exception as exc:
         print(f"ERROR — Shopify auth failed: {exc}")
-        print("Skipping supplier workflow. Customer emails will still be processed.")
+        print("Skipping supplier workflow.")
         shopify_token = None
 
     if shopify_token:
