@@ -2,10 +2,6 @@
 """
 My Secret Sex Toy Delivery — Automated Email Support Worker
 Railway Cron Job — runs every 5 minutes
-
-Two workflows:
-  1. Customer support emails  → auto-reply or draft via Claude
-  2. Supplier tracking emails → update Shopify fulfillment automatically
 """
 
 import os
@@ -25,7 +21,6 @@ ANTHROPIC_KEY         = os.environ["ANTHROPIC_API_KEY"]
 MAILBOX_USER          = os.environ["MAILBOX_USER"]
 SHOPIFY_CLIENT_ID     = os.environ["SHOPIFY_CLIENT_ID"]
 SHOPIFY_CLIENT_SECRET = os.environ["SHOPIFY_CLIENT_SECRET"]
-SHOPIFY_LOCATION      = os.environ.get("SHOPIFY_LOCATION_ID", "")
 
 SHOPIFY_STORE   = "40026a.myshopify.com"
 SHOPIFY_VERSION = "2024-01"
@@ -50,8 +45,6 @@ SKIP_SENDERS = {
     "purepleasure-4.com", "fairyl.com", "foxmail.com", "adamssceptre.com",
     "getsweetums.com", "miamidistro1.com", "tabs.co", "swisstransfer.com",
 }
-
-# ── System Prompt ─────────────────────────────────────────────────────────────
 
 SYSTEM_PROMPT = """
 You are an automated customer support agent for My Secret Sex Toy Delivery
@@ -160,7 +153,6 @@ Respond ONLY with valid JSON — no markdown, no extra text:
 
 def format_reply_html(reply_text: str) -> str:
     SIGNATURE_MARKER = "___________________"
-
     if SIGNATURE_MARKER in reply_text:
         body_part, sig_part = reply_text.split(SIGNATURE_MARKER, 1)
     else:
@@ -205,7 +197,7 @@ def notify(message: str):
     except Exception:
         pass
 
-# ── Microsoft Graph helpers ───────────────────────────────────────────────────
+# ── Microsoft Graph ───────────────────────────────────────────────────────────
 
 def get_ms_token() -> str:
     resp = requests.post(
@@ -225,10 +217,7 @@ def get_ms_token() -> str:
 def graph(method: str, path: str, token: str, **kwargs):
     headers = kwargs.pop("headers", {})
     headers["Authorization"] = f"Bearer {token}"
-    return requests.request(
-        method, f"{GRAPH_BASE}{path}",
-        headers=headers, timeout=20, **kwargs,
-    )
+    return requests.request(method, f"{GRAPH_BASE}{path}", headers=headers, timeout=20, **kwargs)
 
 
 def get_unread_inbox(token: str) -> list:
@@ -236,7 +225,7 @@ def get_unread_inbox(token: str) -> list:
         "$filter": "isRead eq false",
         "$select": "id,subject,from,body,bodyPreview,receivedDateTime,conversationId",
         "$orderby": "receivedDateTime asc",
-        "$top":     50,
+        "$top": 50,
     })
     resp.raise_for_status()
     return resp.json().get("value", [])
@@ -247,7 +236,7 @@ def get_unread_supplier_emails(token: str) -> list:
         "$filter": "isRead eq false",
         "$select": "id,subject,from,body,bodyPreview,receivedDateTime",
         "$orderby": "receivedDateTime asc",
-        "$top":     25,
+        "$top": 25,
     })
     resp.raise_for_status()
     return resp.json().get("value", [])
@@ -257,7 +246,7 @@ def already_replied(token: str, conversation_id: str, received_dt: str) -> bool:
     resp = graph("GET", f"/users/{MAILBOX_USER}/mailFolders/sentitems/messages", token, params={
         "$filter": f"conversationId eq '{conversation_id}'",
         "$select": "sentDateTime",
-        "$top":    10,
+        "$top": 10,
     })
     if not resp.ok:
         return False
@@ -276,8 +265,7 @@ def draft_exists(token: str, conversation_id: str) -> bool:
 
 def mark_read(token: str, message_id: str):
     graph("PATCH", f"/users/{MAILBOX_USER}/messages/{message_id}", token,
-          headers={"Content-Type": "application/json"},
-          json={"isRead": True})
+          headers={"Content-Type": "application/json"}, json={"isRead": True})
 
 
 def create_reply_draft(token: str, message_id: str) -> str:
@@ -310,7 +298,7 @@ def save_reply_draft(token: str, message_id: str, reply_text: str):
     draft_id = create_reply_draft(token, message_id)
     update_draft_body(token, draft_id, format_reply_html(reply_text))
 
-# ── Shopify Auth ──────────────────────────────────────────────────────────────
+# ── Shopify ───────────────────────────────────────────────────────────────────
 
 def get_shopify_token() -> str:
     resp = requests.post(
@@ -325,15 +313,11 @@ def get_shopify_token() -> str:
     resp.raise_for_status()
     return resp.json()["access_token"]
 
-# ── Shopify API helpers ───────────────────────────────────────────────────────
 
 def shopify_get(path: str, shopify_token: str) -> dict:
     resp = requests.get(
         f"https://{SHOPIFY_STORE}/admin/api/{SHOPIFY_VERSION}/{path}",
-        headers={
-            "X-Shopify-Access-Token": shopify_token,
-            "Content-Type": "application/json",
-        },
+        headers={"X-Shopify-Access-Token": shopify_token, "Content-Type": "application/json"},
         timeout=15,
     )
     resp.raise_for_status()
@@ -343,16 +327,13 @@ def shopify_get(path: str, shopify_token: str) -> dict:
 def shopify_post(path: str, data: dict, shopify_token: str) -> dict:
     resp = requests.post(
         f"https://{SHOPIFY_STORE}/admin/api/{SHOPIFY_VERSION}/{path}",
-        headers={
-            "X-Shopify-Access-Token": shopify_token,
-            "Content-Type": "application/json",
-        },
+        headers={"X-Shopify-Access-Token": shopify_token, "Content-Type": "application/json"},
         json=data, timeout=15,
     )
     resp.raise_for_status()
     return resp.json()
 
-# ── Shopify fulfillment helpers ───────────────────────────────────────────────
+# ── Supplier email helpers ────────────────────────────────────────────────────
 
 def detect_carrier(url: str) -> str:
     u = url.lower()
@@ -381,13 +362,6 @@ def extract_tracking_number(tracking_url: str, carrier: str) -> str:
 
 
 def extract_supplier_email_data(body_text: str, body_raw: str = "") -> dict:
-    """
-    Extract customer name and tracking URL from supplier email.
-
-    Searches both raw body (preserves href links in HTML emails)
-    and stripped text (handles plain-text emails with <url> format).
-    """
-    # Customer name
     name_match = re.search(r"Hi\s+(.+?),\s+your order has shipped", body_text, re.IGNORECASE)
     customer_name = name_match.group(1).strip() if name_match else ""
 
@@ -398,8 +372,6 @@ def extract_supplier_email_data(body_text: str, body_raw: str = "") -> dict:
     ]
 
     tracking_url = ""
-
-    # Search raw body first (catches href in HTML), then stripped text
     for source in [body_raw, body_text]:
         if not source:
             continue
@@ -418,44 +390,31 @@ def find_unfulfilled_order(customer_name: str, shopify_token: str) -> dict:
     try:
         name_parts = customer_name.strip().split()
 
-        # Duplicate name (e.g. "Fajardo Fajardo") → search single name
         if len(name_parts) == 2 and name_parts[0].lower() == name_parts[1].lower():
-            search_query = name_parts[0]
-            print(f"   Duplicate name — searching as: '{search_query}'")
+            search_name = name_parts[0].lower()
+            print(f"   Duplicate name — searching as: '{search_name}'")
         else:
-            search_query = customer_name.strip()
-
-        customers = shopify_get(
-            f"customers/search.json?query={quote(search_query)}&limit=10&fields=id,first_name,last_name",
-            shopify_token,
-        ).get("customers", [])
-
-        if not customers:
-            return {}
-
-        name_lower = search_query.lower()
-        matched_id = None
-
-        for c in customers:
-            first = (c.get("first_name") or "").strip().lower()
-            last  = (c.get("last_name")  or "").strip().lower()
-            if first == name_lower or last == name_lower:
-                matched_id = c["id"]
-                break
-
-        if not matched_id:
-            matched_id = customers[0]["id"]
+            search_name = customer_name.strip().lower()
 
         orders = shopify_get(
-            f"orders.json?customer_id={matched_id}"
-            f"&fulfillment_status=unfulfilled&status=open&limit=5",
+            "orders.json?fulfillment_status=unfulfilled&status=open"
+            "&limit=100&fields=id,name,customer",
             shopify_token,
         ).get("orders", [])
 
-        return orders[0] if orders else {}
+        for order in orders:
+            customer = order.get("customer") or {}
+            first = (customer.get("first_name") or "").strip().lower()
+            last  = (customer.get("last_name")  or "").strip().lower()
+            full  = f"{first} {last}".strip()
+
+            if first == search_name or last == search_name or full == search_name:
+                return order
+
+        return {}
 
     except Exception as exc:
-        print(f"   ERROR searching Shopify: {exc}")
+        print(f"   ERROR searching orders: {exc}")
         return {}
 
 
@@ -468,13 +427,9 @@ def create_fulfillment(order_id: int, tracking_number: str,
             shopify_token,
         ).get("fulfillment_orders", [])
 
-        print(f"   Fulfillment orders: {len(fulfillment_orders)}")
-        for fo in fulfillment_orders:
-            print(f"     FO {fo['id']} status: {fo['status']}")
-
         open_fos = [fo for fo in fulfillment_orders if fo["status"] == "open"]
         if not open_fos:
-            print(f"   No open fulfillment orders for order {order_id}")
+            print(f"   No open fulfillment orders for {order_id}")
             return False
 
         result = shopify_post("fulfillments.json", {
@@ -533,7 +488,7 @@ def ask_claude(subject: str, body: str, sender: str) -> dict:
             raw = raw[4:]
     return json.loads(raw.strip())
 
-# ── Workflow 1: Supplier tracking emails ──────────────────────────────────────
+# ── Workflow 1: Supplier tracking ─────────────────────────────────────────────
 
 def process_supplier_emails(ms_token: str, shopify_token: str):
     print(f"\n{'─'*60}")
@@ -554,20 +509,19 @@ def process_supplier_emails(ms_token: str, shopify_token: str):
         print(f"\n-> '{subject}' | {received_dt}")
 
         if parse_dt(received_dt) < CUTOFF_DATE:
-            print("   Skipped — older than cutoff (not marked read)")
+            print("   Skipped — older than cutoff")
             continue
 
-        # Pass BOTH raw and stripped — raw preserves href links in HTML emails
         data          = extract_supplier_email_data(body_text, body_raw)
         customer_name = data["customer_name"]
         tracking_url  = data["tracking_url"]
 
         if not customer_name:
-            print("   Could not extract customer name — not marked read")
+            print("   Could not extract customer name")
             continue
 
         if not tracking_url:
-            print(f"   No tracking URL found for '{customer_name}' — not marked read")
+            print(f"   No tracking URL found for '{customer_name}'")
             continue
 
         carrier         = detect_carrier(tracking_url)
@@ -576,44 +530,28 @@ def process_supplier_emails(ms_token: str, shopify_token: str):
         print(f"   Customer:  {customer_name}")
         print(f"   Carrier:   {carrier}")
         print(f"   Tracking:  {tracking_number}")
-        print(f"   URL:       {tracking_url}")
 
         order = find_unfulfilled_order(customer_name, shopify_token)
         if not order:
-            print(f"   WARNING — No unfulfilled order for '{customer_name}' — not marked read")
-            notify(
-                f"⚠️ <b>No order match</b>\n"
-                f"Customer: {customer_name}\n"
-                f"{carrier} | {tracking_number}\n"
-                f"Manual action needed"
-            )
+            print(f"   WARNING — No unfulfilled order for '{customer_name}'")
+            notify(f"⚠️ <b>No order match</b>\nCustomer: {customer_name}\n{carrier} | {tracking_number}")
             continue
 
         order_name = order.get("name", "")
         order_id   = order["id"]
         print(f"   Shopify order: {order_name} (ID: {order_id})")
 
-        success = create_fulfillment(
-            order_id, tracking_number, tracking_url, carrier, shopify_token
-        )
+        success = create_fulfillment(order_id, tracking_number, tracking_url, carrier, shopify_token)
 
         if success:
             mark_read(ms_token, msg_id)
             print(f"   ✅ Fulfilled — customer will receive tracking email")
-            notify(
-                f"📦 <b>Fulfilled</b>\n"
-                f"Customer: {customer_name} | Order: {order_name}\n"
-                f"{carrier} | {tracking_number}"
-            )
+            notify(f"📦 <b>Fulfilled</b>\nCustomer: {customer_name} | Order: {order_name}\n{carrier} | {tracking_number}")
         else:
             print(f"   ❌ Fulfillment failed — not marked read")
-            notify(
-                f"❌ <b>Fulfillment failed</b>\n"
-                f"Customer: {customer_name} | Order: {order_name}\n"
-                f"Check Railway logs"
-            )
+            notify(f"❌ <b>Fulfillment failed</b>\nCustomer: {customer_name} | Order: {order_name}")
 
-# ── Workflow 2: Customer support emails ───────────────────────────────────────
+# ── Workflow 2: Customer support ──────────────────────────────────────────────
 
 def process_customer_emails(ms_token: str):
     print(f"\n{'─'*60}")
@@ -637,7 +575,7 @@ def process_customer_emails(ms_token: str):
         print(f"\n-> '{subject}' | from: {sender_address} | {received_dt}")
 
         if parse_dt(received_dt) < CUTOFF_DATE:
-            print("   Skipped — older than cutoff (not marked read)")
+            print("   Skipped — older than cutoff")
             continue
 
         if sender_domain in SKIP_SENDERS or sender_address in SKIP_SENDERS:
@@ -658,7 +596,6 @@ def process_customer_emails(ms_token: str):
             result = ask_claude(subject, body_text, sender_address)
         except Exception as exc:
             print(f"   ERROR — Claude failed: {exc}")
-            print("   Not marked as read (will retry)")
             continue
 
         if not result.get("is_customer_email", True):
@@ -705,7 +642,6 @@ def main():
         print("Shopify token: OK")
     except Exception as exc:
         print(f"ERROR — Shopify auth failed: {exc}")
-        print("Skipping supplier workflow.")
         shopify_token = None
 
     if shopify_token:
